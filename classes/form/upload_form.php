@@ -80,7 +80,7 @@ class upload_form extends \moodleform {
         $mform->setType('delimiter', PARAM_ALPHA);
         $mform->setDefault('delimiter', 'comma');
 
-        $mform->addElement('select', 'encoding', get_string('encoding', 'local_bulkcohortenrol'), \core_text::get_encodings());
+        $mform->addElement('select', 'encoding', get_string('encoding', 'local_bulkcohortenrol'), \local_bulkcohortenrol\importer::encodings());
         $mform->setType('encoding', PARAM_RAW_TRIMMED);
         $mform->setDefault('encoding', 'UTF-8');
 
@@ -116,8 +116,7 @@ class upload_form extends \moodleform {
         if (!array_key_exists($data['delimiter'] ?? '', $delimiters)) {
             $errors['delimiter'] = get_string('invaliddelimiter', 'local_bulkcohortenrol');
         }
-        $encodings = \core_text::get_encodings();
-        if (!array_key_exists($data['encoding'] ?? '', $encodings)) {
+        if (!array_key_exists($data['encoding'] ?? '', \local_bulkcohortenrol\importer::encodings())) {
             $errors['encoding'] = get_string('invalidencoding', 'local_bulkcohortenrol');
         }
 
@@ -136,7 +135,7 @@ class upload_form extends \moodleform {
             return $errors;
         }
 
-        [$reader, $error] = \local_bulkcohortenrol\importer::open_content(
+        [$reader, , $error] = \local_bulkcohortenrol\importer::open_content(
             $file->get_content(),
             $data['encoding'],
             $data['delimiter'],

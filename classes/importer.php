@@ -78,14 +78,14 @@ class importer {
         global $SESSION, $USER;
 
         $file = self::draft_file($draftitemid);
-        [$reader, $error] = self::open_content($file->get_content(), $encoding, $delimiter, $matchfield);
+        [$reader, $iid, $error] = self::open_content($file->get_content(), $encoding, $delimiter, $matchfield);
         if ($error !== null || $reader === null) {
             throw new \moodle_exception('invalidcsv', 'local_bulkcohortenrol', '', $error ?? '');
         }
 
         self::clear_pending();
         $SESSION->local_bulkcohortenrol_pending = (object) [
-            'iid' => $reader->get_iid(),
+            'iid' => $iid,
             'cohortname' => trim($cohortname),
             'idnumber' => trim($idnumber),
             'matchfield' => $matchfield,
@@ -119,30 +119,31 @@ class importer {
      * @param string $encoding
      * @param string $delimiter
      * @param string $matchfield username or email
-     * @return array{0: \csv_import_reader|null, 1: string|null}
+     * @return array{0: \csv_import_reader|null, 1: int, 2: string|null}
      */
     public static function open_content(string $content, string $encoding, string $delimiter, string $matchfield): array {
         self::assert_options($delimiter, $encoding, $matchfield);
 
-        $reader = new \csv_import_reader(\csv_import_reader::get_new_iid(self::IMPORT_TYPE), self::IMPORT_TYPE);
+        $iid = \csv_import_reader::get_new_iid(self::IMPORT_TYPE);
+        $reader = new \csv_import_reader($iid, self::IMPORT_TYPE);
         $loaded = $reader->load_csv_content($content, $encoding, $delimiter);
         if ($loaded === false) {
             $error = $reader->get_error() ?: get_string('invalidcsv', 'local_bulkcohortenrol', '');
             $reader->cleanup();
-            return [null, $error];
+            return [null, 0, $error];
         }
         if ((int) $loaded < 2) {
             $reader->cleanup();
-            return [null, get_string('csvnodata', 'local_bulkcohortenrol')];
+            return [null, 0, get_string('csvnodata', 'local_bulkcohortenrol')];
         }
 
         $map = self::header_map($reader->get_columns() ?: []);
         if (!isset($map[$matchfield])) {
             $reader->cleanup();
             $label = get_string($matchfield === 'email' ? 'matchemail' : 'matchusername', 'local_bulkcohortenrol');
-            return [null, get_string('missingcolumn', 'local_bulkcohortenrol', $label)];
+            return [null, 0, get_string('missingcolumn', 'local_bulkcohortenrol', $label)];
         }
-        return [$reader, null];
+        return [$reader, $iid, null];
     }
 
     /**
@@ -174,39 +175,63 @@ class importer {
         $context = \context_system::instance();
         require_capability('local/bulkcohortenrol:manage', $context);
 
-        $transaction = $DB->start_delegated_transaction();
         $plan = self::analyse($pending);
         if ($plan->blocked !== '' || !$plan->canapply) {
             throw new \moodle_exception('cannotapply', 'local_bulkcohortenrol');
         }
 
         require_capability('moodle/cohort:assign', $context);
-        $created = false;
-        if ($plan->cohort) {
-            $cohortid = (int) $plan->cohort->id;
-            $cohortname = $plan->cohort->name;
-        } else {
+        if (!$plan->cohort) {
             require_capability('moodle/cohort:manage', $context);
-            $record = (object) [
-                'contextid' => $context->id,
-                'name' => $plan->cohortname,
-                'description' => '',
-                'descriptionformat' => FORMAT_HTML,
-                'visible' => 1,
-                'component' => '',
-            ];
-            if ($plan->idnumber !== '') {
-                $record->idnumber = $plan->idnumber;
-            }
-            $cohortid = cohort_add_cohort($record);
-            $cohortname = $plan->cohortname;
-            $created = true;
         }
 
-        foreach ($plan->userids as $userid) {
-            cohort_add_member($cohortid, (int) $userid);
+        $created = false;
+        $cohortid = 0;
+        $cohortname = $plan->cohortname;
+        $transaction = $DB->start_delegated_transaction();
+        try {
+            if ($plan->cohort) {
+                $cohort = $DB->get_record('cohort', ['id' => $plan->cohort->id], '*', MUST_EXIST);
+                if ((int) $cohort->contextid !== (int) $context->id) {
+                    throw new \moodle_exception('cannotapply', 'local_bulkcohortenrol');
+                }
+                $cohortid = (int) $cohort->id;
+                $cohortname = $cohort->name;
+            } else {
+                $existing = null;
+                if ($plan->idnumber !== '') {
+                    $existing = $DB->get_record('cohort', ['idnumber' => $plan->idnumber]);
+                }
+                if ($existing) {
+                    if ((int) $existing->contextid !== (int) $context->id) {
+                        throw new \moodle_exception('cannotapply', 'local_bulkcohortenrol');
+                    }
+                    $cohortid = (int) $existing->id;
+                    $cohortname = $existing->name;
+                } else {
+                    $record = (object) [
+                        'contextid' => $context->id,
+                        'name' => $plan->cohortname,
+                        'description' => '',
+                        'descriptionformat' => FORMAT_HTML,
+                        'visible' => 1,
+                        'component' => '',
+                    ];
+                    if ($plan->idnumber !== '') {
+                        $record->idnumber = $plan->idnumber;
+                    }
+                    $cohortid = cohort_add_cohort($record);
+                    $created = true;
+                }
+            }
+
+            foreach ($plan->userids as $userid) {
+                cohort_add_member($cohortid, (int) $userid);
+            }
+            $transaction->allow_commit();
+        } catch (\Throwable $exception) {
+            $transaction->rollback($exception);
         }
-        $transaction->allow_commit();
 
         $result = new \stdClass();
         $result->cohortid = $cohortid;
@@ -241,6 +266,28 @@ class importer {
     }
 
     /**
+     * Encodings offered in the upload form.
+     *
+     * Windows-1255 is included because Hebrew Excel files use it, and it is not
+     * always present in Moodle's own encoding list.
+     *
+     * @return array<string, string>
+     */
+    public static function encodings(): array {
+        $encodings = [
+            'UTF-8' => 'UTF-8',
+            'WINDOWS-1255' => 'WINDOWS-1255',
+            'ISO-8859-8' => 'ISO-8859-8',
+        ];
+        foreach (\core_text::get_encodings() as $encoding => $label) {
+            if (!isset($encodings[$encoding])) {
+                $encodings[$encoding] = $label;
+            }
+        }
+        return $encodings;
+    }
+
+    /**
      * @param string $delimiter
      * @param string $encoding
      * @param string $matchfield
@@ -250,8 +297,7 @@ class importer {
         if (!array_key_exists($delimiter, $delimiters)) {
             throw new \moodle_exception('invaliddelimiter', 'local_bulkcohortenrol');
         }
-        $encodings = \core_text::get_encodings();
-        if (!array_key_exists($encoding, $encodings)) {
+        if (!array_key_exists($encoding, self::encodings())) {
             throw new \moodle_exception('invalidencoding', 'local_bulkcohortenrol');
         }
         if (!in_array($matchfield, ['username', 'email'], true)) {
